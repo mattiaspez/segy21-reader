@@ -1,0 +1,22 @@
+# Claude Code local config
+.claude/
+
+# Large binary test data (real SEG-Y survey files)
+tests/rev0/*.segy
+tests/rev0/*.sgy
+tests/rev0/*.seg
+tests/rev21/*.segy
+tests/rev21/*.sgy
+tests/rev21/*.sgy.gz
+
+# Generated test data (created at test-time by make_synthetic.py)
+tests/rev1/
+tests/rev20/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+dist/
+build/
