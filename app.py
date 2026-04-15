@@ -84,8 +84,8 @@ def load_segy(path: str):
         for hdr, data in r.traces():
             headers.append({
                 "trace_seq":  hdr.get("trace_seq_file", 0),
-                "inline":     hdr.get("inline_no", 0) or hdr.get("trace_no_in_record", 0),
-                "crossline":  hdr.get("crossline_no", 0) or hdr.get("energy_source_point", 0),
+                "inline":     hdr.get("inline_no", 0),
+                "crossline":  hdr.get("crossline_no", 0),
                 "cdp_x":      hdr.get("cdp_x", 0),
                 "cdp_y":      hdr.get("cdp_y", 0),
                 "offset":     hdr.get("source_receiver_dist", 0),
@@ -95,6 +95,16 @@ def load_segy(path: str):
             traces_data.append(data.astype(np.float32))
 
     df = pd.DataFrame(headers)
+
+    # Detect implausible inline/crossline values: real grid indices are small integers;
+    # values > 100,000 indicate the standard bytes contain coordinates instead,
+    # meaning the file uses non-standard header locations (pre-Rev-1 files).
+    COORD_THRESHOLD = 100_000
+    nonstandard_grid = (
+        df["inline"].abs().max() > COORD_THRESHOLD or
+        df["crossline"].abs().max() > COORD_THRESHOLD
+    )
+
     # If inline/crossline are both 0, fall back to sequential numbering
     if df["inline"].eq(0).all() and df["crossline"].eq(0).all():
         df["inline"]    = 1
@@ -107,18 +117,41 @@ def load_segy(path: str):
     cube = np.stack(traces_data, axis=0)  # shape (n_traces, n_samples)
 
     return {
-        "textual":    txt,
-        "binary":     bh,
-        "extended":   ext,
-        "headers":    df,
-        "cube":       cube,
-        "time_ms":    time_axis,
-        "n_samples":  n_samples,
-        "dt_us":      dt_us,
+        "textual":        txt,
+        "binary":         bh,
+        "extended":       ext,
+        "headers":        df,
+        "cube":           cube,
+        "time_ms":        time_axis,
+        "n_samples":      n_samples,
+        "dt_us":          dt_us,
+        "nonstandard_grid": nonstandard_grid,
     }
 
 data = load_segy(file_path)
-df   = data["headers"]
+
+if data["nonstandard_grid"]:
+    st.warning(
+        "**Non-standard header layout detected.** "
+        "The inline/crossline fields at the standard SEG-Y bytes (189–196) contain "
+        "implausibly large values — this file likely stores inline/crossline at "
+        "non-standard byte locations (common in pre-Rev-1 files). "
+        "Inline and crossline numbers shown in the app may be incorrect.",
+        icon="⚠️",
+    )
+    remap = st.checkbox(
+        "Use CDP X/Y bytes (181–188) as inline/crossline instead",
+        value=False,
+        help="For some pre-Rev-1 files the standard CDP X/Y bytes happen to contain "
+             "the inline/crossline grid numbers. Enable this to use those values.",
+    )
+else:
+    remap = False
+
+df = data["headers"].copy()
+if remap:
+    df["inline"]    = df["cdp_x"]
+    df["crossline"] = df["cdp_y"]
 cube = data["cube"]
 time = data["time_ms"]
 bh   = data["binary"]
@@ -141,6 +174,7 @@ with tab_section:
     inlines    = sorted(df["inline"].unique())
     crosslines = sorted(df["crossline"].unique())
 
+    # ── Row 1: slice + display mode ──────────────────────────────────
     col1, col2, col3 = st.columns([2, 2, 2])
 
     with col1:
@@ -165,13 +199,32 @@ with tab_section:
             selected = None
 
     with col3:
-        colorscale = st.selectbox("Colour scale",
-                                  ["RdBu", "Greys", "seismic", "RdGy", "PiYG"],
-                                  index=0)
+        display_mode = st.radio(
+            "Display mode",
+            ["Density", "Interpolated density", "Wiggles"],
+            horizontal=True,
+        )
+
+    # ── Row 2: display options ────────────────────────────────────────
+    col_a, col_b, col_c = st.columns([2, 2, 2])
+
+    with col_a:
         clip_pct = st.slider("Clip percentile", 90, 100, 99,
                              help="Clips display range to this percentile of amplitude")
 
-    # Select traces for the section
+    with col_b:
+        if display_mode in ("Density", "Interpolated density"):
+            colorscale = st.selectbox("Colour scale",
+                                      ["RdBu", "Greys", "seismic", "RdGy", "PiYG"],
+                                      index=0)
+        else:
+            wiggle_scale = st.slider("Wiggle scale", 0.2, 3.0, 1.0, step=0.1,
+                                     help="Scales wiggle amplitude relative to trace spacing")
+
+    with col_c:
+        plot_height = st.slider("Plot height (px)", 300, 1200, 600, step=50)
+
+    # ── Trace selection ───────────────────────────────────────────────
     if orient == "Inline":
         mask = df["inline"] == selected
         x_label = "Crossline"
@@ -190,31 +243,87 @@ with tab_section:
     if section.shape[0] == 0:
         st.warning("No traces found for this selection.")
     else:
-        # Colour limits
         vmax = np.nanpercentile(np.abs(section), clip_pct)
         vmax = vmax if vmax > 0 else 1.0
-
-        fig = go.Figure(go.Heatmap(
-            z=section.T,          # (n_samples, n_traces) → rows=time, cols=trace
-            x=x_vals,
-            y=time,
-            colorscale=colorscale,
-            zmid=0,
-            zmin=-vmax,
-            zmax=vmax,
-            colorbar=dict(title="Amplitude"),
-        ))
 
         title_str = (f"Inline {selected}" if orient == "Inline"
                      else f"Crossline {selected}" if orient == "Crossline"
                      else "All traces")
+
+        # ── Density / Interpolated density ───────────────────────────
+        if display_mode in ("Density", "Interpolated density"):
+            zsmooth = "best" if display_mode == "Interpolated density" else False
+            fig = go.Figure(go.Heatmap(
+                z=section.T,
+                x=x_vals,
+                y=time,
+                colorscale=colorscale,
+                zmid=0,
+                zmin=-vmax,
+                zmax=vmax,
+                zsmooth=zsmooth,
+                colorbar=dict(title="Amplitude"),
+            ))
+
+        # ── Wiggles ──────────────────────────────────────────────────
+        else:
+            WIGGLE_TRACE_LIMIT = 500
+            if section.shape[0] > WIGGLE_TRACE_LIMIT:
+                st.warning(
+                    f"Too many traces ({section.shape[0]}) for wiggle display "
+                    f"(limit {WIGGLE_TRACE_LIMIT}). Switch to Density mode or narrow your slice."
+                )
+                st.stop()
+
+            fig = go.Figure()
+
+            n_tr = len(x_vals)
+            if n_tr > 1:
+                trace_spacing = (float(x_vals[-1]) - float(x_vals[0])) / (n_tr - 1)
+                trace_spacing = abs(trace_spacing) if trace_spacing != 0 else 1.0
+            else:
+                trace_spacing = 1.0
+
+            scale = wiggle_scale * trace_spacing / vmax
+
+            for i, x_pos in enumerate(x_vals):
+                amp = section[i] * scale   # scaled amplitude offset
+
+                # Wiggle line
+                fig.add_trace(go.Scatter(
+                    x=x_pos + amp,
+                    y=time,
+                    mode="lines",
+                    line=dict(color="black", width=0.8),
+                    showlegend=False,
+                    hoverinfo="skip",
+                ))
+
+                # Positive-amplitude fill (variable area)
+                pos_amp = np.maximum(amp, 0.0)
+                fill_x = np.concatenate([x_pos + pos_amp, np.full(len(time), x_pos)[::-1]])
+                fill_y = np.concatenate([time, time[::-1]])
+                fig.add_trace(go.Scatter(
+                    x=fill_x,
+                    y=fill_y,
+                    fill="toself",
+                    fillcolor="black",
+                    line=dict(width=0),
+                    showlegend=False,
+                    hoverinfo="skip",
+                ))
+
+            fig.update_xaxes(range=[
+                float(x_vals[0])  - trace_spacing,
+                float(x_vals[-1]) + trace_spacing,
+            ])
 
         fig.update_layout(
             title=title_str,
             xaxis_title=x_label,
             yaxis_title="Time (ms)",
             yaxis_autorange="reversed",
-            height=600,
+            height=plot_height,
             margin=dict(l=60, r=20, t=50, b=50),
         )
         st.plotly_chart(fig, use_container_width=True)
