@@ -157,6 +157,45 @@ time = data["time_ms"]
 bh   = data["binary"]
 
 # ------------------------------------------------------------------ #
+# Height control fragment — only resizes chart via JS, never re-renders it
+# ------------------------------------------------------------------ #
+
+@st.fragment
+def _height_control():
+    h = st.slider("Plot height (px)", 300, 1200, 600, step=50, key="_sec_height")
+    # Resize chart by setting CSS height on the container, then firing a
+    # window resize event — Plotly's responsive handler redraws without
+    # resetting zoom (no Plotly global needed).
+    st.components.v1.html(f"""
+    <script>
+    (function() {{
+        var p = window.parent;
+        var h = {h};
+        function resize() {{
+            var gd = p.document.querySelector('[data-testid="stPlotlyChart"] .js-plotly-plot')
+                  || p.document.querySelector('.js-plotly-plot');
+            if (!gd) return false;
+            gd.style.height = h + 'px';
+            gd.style.minHeight = h + 'px';
+            var wrapper = gd.closest('[data-testid="stPlotlyChart"]') || gd.parentElement;
+            if (wrapper) {{
+                wrapper.style.height = h + 'px';
+                wrapper.style.minHeight = h + 'px';
+            }}
+            p.dispatchEvent(new Event('resize'));
+            return true;
+        }}
+        if (!resize()) {{
+            var n = 0, t = setInterval(function() {{
+                if (resize() || ++n > 20) clearInterval(t);
+            }}, 100);
+        }}
+    }})();
+    </script>
+    """, height=1)
+
+
+# ------------------------------------------------------------------ #
 # Tabs
 # ------------------------------------------------------------------ #
 
@@ -174,14 +213,11 @@ with tab_section:
     inlines    = sorted(df["inline"].unique())
     crosslines = sorted(df["crossline"].unique())
 
-    # ── Row 1: slice + display mode ──────────────────────────────────
-    col1, col2, col3 = st.columns([2, 2, 2])
+    col_ctrl, col_plot = st.columns([1, 4])
 
-    with col1:
-        orient = st.radio("Slice direction", ["Inline", "Crossline", "All traces"],
-                          horizontal=True)
+    with col_ctrl:
+        orient = st.radio("Slice direction", ["Inline", "Crossline", "All traces"])
 
-    with col2:
         if orient == "Inline":
             if len(inlines) > 1:
                 selected = st.select_slider("Inline", options=inlines, value=inlines[0])
@@ -198,33 +234,28 @@ with tab_section:
         else:
             selected = None
 
-    with col3:
         display_mode = st.radio(
             "Display mode",
             ["Density", "Interpolated density", "Wiggles"],
-            horizontal=True,
+            index=1,
         )
 
-    # ── Row 2: display options ────────────────────────────────────────
-    col_a, col_b, col_c = st.columns([2, 2, 2])
-
-    with col_a:
-        clip_pct = st.slider("Clip percentile", 90, 100, 99,
-                             help="Clips display range to this percentile of amplitude")
-
-    with col_b:
         if display_mode in ("Density", "Interpolated density"):
             colorscale = st.selectbox("Colour scale",
-                                      ["RdBu", "Greys", "seismic", "RdGy", "PiYG"],
+                                      ["rdbu", "greys", "picnic", "rdgy", "piyg", "balance", "icefire"],
                                       index=0)
+            wiggle_scale = None
         else:
             wiggle_scale = st.slider("Wiggle scale", 0.2, 3.0, 1.0, step=0.1,
                                      help="Scales wiggle amplitude relative to trace spacing")
+            colorscale = None
 
-    with col_c:
-        plot_height = st.slider("Plot height (px)", 300, 1200, 600, step=50)
+        clip_pct = st.slider("Clip percentile", 90, 100, 99,
+                             help="Clips display range to this percentile of amplitude")
 
-    # ── Trace selection ───────────────────────────────────────────────
+        _height_control()
+
+    # ── Compute section data ──────────────────────────────────────────
     if orient == "Inline":
         mask = df["inline"] == selected
         x_label = "Crossline"
@@ -238,101 +269,75 @@ with tab_section:
         x_label = "Trace #"
         x_vals  = df.index.values
 
-    section = cube[mask.values]   # (n_selected, n_samples)
+    section = cube[mask.values]
 
-    if section.shape[0] == 0:
-        st.warning("No traces found for this selection.")
-    else:
-        vmax = np.nanpercentile(np.abs(section), clip_pct)
-        vmax = vmax if vmax > 0 else 1.0
+    with col_ctrl:
+        if display_mode == "Wiggles" and section.shape[0] > 500:
+            st.warning(f"Too many traces ({section.shape[0]}) for wiggle display (limit 500).")
 
-        title_str = (f"Inline {selected}" if orient == "Inline"
-                     else f"Crossline {selected}" if orient == "Crossline"
-                     else "All traces")
-
-        # ── Density / Interpolated density ───────────────────────────
-        if display_mode in ("Density", "Interpolated density"):
-            zsmooth = "best" if display_mode == "Interpolated density" else False
-            fig = go.Figure(go.Heatmap(
-                z=section.T,
-                x=x_vals,
-                y=time,
-                colorscale=colorscale,
-                zmid=0,
-                zmin=-vmax,
-                zmax=vmax,
-                zsmooth=zsmooth,
-                colorbar=dict(title="Amplitude"),
-            ))
-
-        # ── Wiggles ──────────────────────────────────────────────────
+    with col_plot:
+        if section.shape[0] == 0:
+            st.warning("No traces found for this selection.")
         else:
-            WIGGLE_TRACE_LIMIT = 500
-            if section.shape[0] > WIGGLE_TRACE_LIMIT:
-                st.warning(
-                    f"Too many traces ({section.shape[0]}) for wiggle display "
-                    f"(limit {WIGGLE_TRACE_LIMIT}). Switch to Density mode or narrow your slice."
-                )
-                st.stop()
+            vmax = np.nanpercentile(np.abs(section), clip_pct)
+            vmax = vmax if vmax > 0 else 1.0
+            title_str = (f"Inline {selected}" if orient == "Inline"
+                         else f"Crossline {selected}" if orient == "Crossline"
+                         else "All traces")
+            uirev = f"{orient}_{selected}_{display_mode}_{colorscale}_{wiggle_scale}_{clip_pct}"
 
-            fig = go.Figure()
-
-            n_tr = len(x_vals)
-            if n_tr > 1:
-                trace_spacing = (float(x_vals[-1]) - float(x_vals[0])) / (n_tr - 1)
-                trace_spacing = abs(trace_spacing) if trace_spacing != 0 else 1.0
+            if display_mode in ("Density", "Interpolated density"):
+                zsmooth = "best" if display_mode == "Interpolated density" else False
+                fig = go.Figure(go.Heatmap(
+                    z=section.T, x=x_vals, y=time,
+                    colorscale=colorscale, zmid=0,
+                    zmin=-vmax, zmax=vmax, zsmooth=zsmooth,
+                    colorbar=dict(title="Amplitude"),
+                ))
             else:
-                trace_spacing = 1.0
+                if section.shape[0] > 500:
+                    st.warning(
+                        f"Too many traces ({section.shape[0]}) for wiggle display "
+                        f"(limit 500). Switch to Density mode or narrow your slice."
+                    )
+                    st.stop()
+                fig = go.Figure()
+                n_tr = len(x_vals)
+                trace_spacing = (
+                    abs((float(x_vals[-1]) - float(x_vals[0])) / (n_tr - 1))
+                    if n_tr > 1 else 1.0
+                ) or 1.0
+                scale = wiggle_scale * trace_spacing / vmax
+                for i, x_pos in enumerate(x_vals):
+                    amp = section[i] * scale
+                    fig.add_trace(go.Scatter(
+                        x=x_pos + amp, y=time, mode="lines",
+                        line=dict(color="black", width=0.8),
+                        showlegend=False, hoverinfo="skip",
+                    ))
+                    pos_amp = np.maximum(amp, 0.0)
+                    fig.add_trace(go.Scatter(
+                        x=np.concatenate([x_pos + pos_amp, np.full(len(time), x_pos)[::-1]]),
+                        y=np.concatenate([time, time[::-1]]),
+                        fill="toself", fillcolor="black",
+                        line=dict(width=0), showlegend=False, hoverinfo="skip",
+                    ))
+                fig.update_xaxes(range=[float(x_vals[0]) - trace_spacing,
+                                        float(x_vals[-1]) + trace_spacing])
 
-            scale = wiggle_scale * trace_spacing / vmax
-
-            for i, x_pos in enumerate(x_vals):
-                amp = section[i] * scale   # scaled amplitude offset
-
-                # Wiggle line
-                fig.add_trace(go.Scatter(
-                    x=x_pos + amp,
-                    y=time,
-                    mode="lines",
-                    line=dict(color="black", width=0.8),
-                    showlegend=False,
-                    hoverinfo="skip",
-                ))
-
-                # Positive-amplitude fill (variable area)
-                pos_amp = np.maximum(amp, 0.0)
-                fill_x = np.concatenate([x_pos + pos_amp, np.full(len(time), x_pos)[::-1]])
-                fill_y = np.concatenate([time, time[::-1]])
-                fig.add_trace(go.Scatter(
-                    x=fill_x,
-                    y=fill_y,
-                    fill="toself",
-                    fillcolor="black",
-                    line=dict(width=0),
-                    showlegend=False,
-                    hoverinfo="skip",
-                ))
-
-            fig.update_xaxes(range=[
-                float(x_vals[0])  - trace_spacing,
-                float(x_vals[-1]) + trace_spacing,
-            ])
-
-        fig.update_layout(
-            title=title_str,
-            xaxis_title=x_label,
-            yaxis_title="Time (ms)",
-            yaxis_autorange="reversed",
-            height=plot_height,
-            margin=dict(l=60, r=20, t=50, b=50),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.caption(
-            f"{section.shape[0]} traces  ·  {section.shape[1]} samples  ·  "
-            f"dt = {data['dt_us'] / 1000:.2f} ms  ·  "
-            f"record = {time[-1]:.0f} ms"
-        )
+            fig.update_layout(
+                title=title_str, xaxis_title=x_label,
+                yaxis_title="Time (ms)", yaxis_autorange="reversed",
+                height=600, margin=dict(l=60, r=20, t=50, b=50),
+                uirevision=uirev,
+            )
+            st.plotly_chart(fig, use_container_width=True, key="seismic_section",
+                            config={"responsive": True})
+            st.caption(
+                f"{section.shape[0]} traces  ·  {section.shape[1]} samples  ·  "
+                f"dt = {data['dt_us'] / 1000:.2f} ms  ·  "
+                f"record = {time[-1]:.0f} ms"
+            )
 
 # ================================================================== #
 # TAB 2 — SINGLE TRACE
