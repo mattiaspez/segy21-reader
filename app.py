@@ -57,7 +57,7 @@ if not segy_files:
 # Show relative paths so the subfolder is visible in the dropdown
 file_labels = [str(p.relative_to(dir_path)) for p in segy_files]
 default_label = next(
-    (lbl for lbl in file_labels if "BO_3D-Inglewood" in lbl),
+    (lbl for lbl in file_labels if "teapot" in lbl.lower()),
     file_labels[0],
 )
 selected_label = st.sidebar.selectbox("SEG-Y file", file_labels,
@@ -243,7 +243,7 @@ with tab_section:
         if display_mode in ("Density", "Interpolated density"):
             colorscale = st.selectbox("Colour scale",
                                       ["rdbu", "greys", "picnic", "rdgy", "piyg", "balance", "icefire"],
-                                      index=0)
+                                      index=1)
             wiggle_scale = None
         else:
             wiggle_scale = st.slider("Wiggle scale", 0.2, 3.0, 1.0, step=0.1,
