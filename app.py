@@ -157,11 +157,76 @@ time = data["time_ms"]
 bh   = data["binary"]
 
 # ------------------------------------------------------------------ #
-# Height control fragment — only resizes chart via JS, never re-renders it
+# Zoom preservation — saves/restores Plotly zoom via JS window globals
+# (uirevision is not reliably honoured by Streamlit's chart component)
 # ------------------------------------------------------------------ #
 
-def _height_control():
-    st.slider("Plot height (px)", 300, 1200, 600, step=50, key="_sec_height")
+def _restore_zoom(uirev: str):
+    safe_uirev = uirev.replace("\\", "\\\\").replace("'", "\\'")
+    st.components.v1.html(f"""
+    <script>
+    (function() {{
+        var p = window.parent;
+        var uirev = '{safe_uirev}';
+
+        // Patch Plotly.react once.  On every chart update:
+        //   same uirevision → restore saved zoom in .then() (runs after Streamlit's update)
+        //   different uirevision → clear saved zoom and let the chart reset naturally
+        if (p.Plotly && !p._segyReactPatched) {{
+            p._segyReactPatched = true;
+            var _orig = p.Plotly.react.bind(p.Plotly);
+            p.Plotly.react = function(gd, data, layout, config) {{
+                var newRev = layout && layout.uirevision;
+                var same   = (newRev !== undefined) && (newRev === gd._segyPrevUirev);
+                gd._segyPrevUirev = newRev;
+                if (!same) p._segyZoom = null;
+                var promise = _orig(gd, data, layout, config);
+                var saved = same && p._segyZoom;
+                if (saved && promise && promise.then) {{
+                    promise.then(function() {{
+                        try {{
+                            var u = {{'xaxis.autorange': false, 'xaxis.range': saved.x}};
+                            if (saved.y) {{ u['yaxis.autorange'] = false; u['yaxis.range'] = saved.y; }}
+                            p.Plotly.relayout(gd, u);
+                        }} catch(e) {{}}
+                    }});
+                }}
+                return promise;
+            }};
+        }}
+
+        function attach(gd) {{
+            gd._segyPrevUirev = uirev;
+            if (gd._segyZoomSaver) gd.removeListener('plotly_relayout', gd._segyZoomSaver);
+            gd._segyZoomSaver = function(e) {{
+                // Skip relayout events fired by our own restore (autorange explicitly false)
+                if (e['xaxis.range[0]'] !== undefined && e['xaxis.autorange'] !== false) {{
+                    p._segyZoom = {{
+                        x: [+e['xaxis.range[0]'], +e['xaxis.range[1]']],
+                        y: e['yaxis.range[0]'] !== undefined
+                           ? [+e['yaxis.range[0]'], +e['yaxis.range[1]']] : null
+                    }};
+                }}
+                if (e['xaxis.autorange'] === true) p._segyZoom = null;
+            }};
+            gd.on('plotly_relayout', gd._segyZoomSaver);
+        }}
+
+        function init() {{
+            var gd = p.document.querySelector('[data-testid="stPlotlyChart"] .js-plotly-plot');
+            if (!gd || !p.Plotly) return false;
+            attach(gd);
+            return true;
+        }}
+
+        if (!init()) {{
+            var n = 0, t = setInterval(function() {{
+                if (init() || ++n > 20) clearInterval(t);
+            }}, 100);
+        }}
+    }})();
+    </script>
+    """, height=1)
 
 
 # ------------------------------------------------------------------ #
@@ -176,7 +241,8 @@ tab_section, tab_trace, tab_map, tab_headers = st.tabs([
 # TAB 1 — SECTION VIEW
 # ================================================================== #
 
-with tab_section:
+@st.fragment
+def _section_tab(df, cube, time, data):
     st.subheader("Seismic Section")
 
     inlines    = sorted(df["inline"].unique())
@@ -222,7 +288,7 @@ with tab_section:
         clip_pct = st.slider("Clip percentile", 90, 100, 99,
                              help="Clips display range to this percentile of amplitude")
 
-        _height_control()
+        st.slider("Plot height (px)", 300, 1200, 600, step=50, key="_sec_height")
 
     # ── Compute section data ──────────────────────────────────────────
     if orient == "Inline":
@@ -291,8 +357,6 @@ with tab_section:
                         fill="toself", fillcolor="black",
                         line=dict(width=0), showlegend=False, hoverinfo="skip",
                     ))
-                fig.update_xaxes(range=[float(x_vals[0]) - trace_spacing,
-                                        float(x_vals[-1]) + trace_spacing])
 
             stats_str = (
                 f"{section.shape[0]} traces  ·  {section.shape[1]} samples  ·  "
@@ -315,6 +379,11 @@ with tab_section:
             )
             st.plotly_chart(fig, use_container_width=True, key="seismic_section",
                             config={"responsive": True})
+            _restore_zoom(uirev)
+
+
+with tab_section:
+    _section_tab(df, cube, time, data)
 
 # ================================================================== #
 # TAB 2 — SINGLE TRACE
