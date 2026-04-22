@@ -160,39 +160,8 @@ bh   = data["binary"]
 # Height control fragment — only resizes chart via JS, never re-renders it
 # ------------------------------------------------------------------ #
 
-@st.fragment
 def _height_control():
-    h = st.slider("Plot height (px)", 300, 1200, 600, step=50, key="_sec_height")
-    # Resize chart by setting CSS height on the container, then firing a
-    # window resize event — Plotly's responsive handler redraws without
-    # resetting zoom (no Plotly global needed).
-    st.components.v1.html(f"""
-    <script>
-    (function() {{
-        var p = window.parent;
-        var h = {h};
-        function resize() {{
-            var gd = p.document.querySelector('[data-testid="stPlotlyChart"] .js-plotly-plot')
-                  || p.document.querySelector('.js-plotly-plot');
-            if (!gd) return false;
-            gd.style.height = h + 'px';
-            gd.style.minHeight = h + 'px';
-            var wrapper = gd.closest('[data-testid="stPlotlyChart"]') || gd.parentElement;
-            if (wrapper) {{
-                wrapper.style.height = h + 'px';
-                wrapper.style.minHeight = h + 'px';
-            }}
-            p.dispatchEvent(new Event('resize'));
-            return true;
-        }}
-        if (!resize()) {{
-            var n = 0, t = setInterval(function() {{
-                if (resize() || ++n > 20) clearInterval(t);
-            }}, 100);
-        }}
-    }})();
-    </script>
-    """, height=1)
+    st.slider("Plot height (px)", 300, 1200, 600, step=50, key="_sec_height")
 
 
 # ------------------------------------------------------------------ #
@@ -284,7 +253,7 @@ with tab_section:
             title_str = (f"Inline {selected}" if orient == "Inline"
                          else f"Crossline {selected}" if orient == "Crossline"
                          else "All traces")
-            uirev = f"{orient}_{selected}_{display_mode}_{colorscale}_{wiggle_scale}_{clip_pct}"
+            uirev = f"{orient}_{selected}"
 
             if display_mode in ("Density", "Interpolated density"):
                 zsmooth = "best" if display_mode == "Interpolated density" else False
@@ -325,19 +294,27 @@ with tab_section:
                 fig.update_xaxes(range=[float(x_vals[0]) - trace_spacing,
                                         float(x_vals[-1]) + trace_spacing])
 
-            fig.update_layout(
-                title=title_str, xaxis_title=x_label,
-                yaxis_title="Time (ms)", yaxis_autorange="reversed",
-                height=600, margin=dict(l=60, r=20, t=50, b=50),
-                uirevision=uirev,
-            )
-            st.plotly_chart(fig, use_container_width=True, key="seismic_section",
-                            config={"responsive": True})
-            st.caption(
+            stats_str = (
                 f"{section.shape[0]} traces  ·  {section.shape[1]} samples  ·  "
                 f"dt = {data['dt_us'] / 1000:.2f} ms  ·  "
                 f"record = {time[-1]:.0f} ms"
             )
+            plot_h = st.session_state.get("_sec_height", 600)
+            fig.update_layout(
+                title=dict(text=f"<b>{title_str}</b>", x=0.01, xanchor="left",
+                           yanchor="top", font=dict(size=13)),
+                annotations=[dict(
+                    text=stats_str, xref="paper", yref="paper",
+                    x=0.5, y=1.0, xanchor="center", yanchor="bottom",
+                    showarrow=False, font=dict(size=11, color="grey"),
+                )],
+                xaxis_title=x_label,
+                yaxis_title="Time (ms)", yaxis_autorange="reversed",
+                height=plot_h, margin=dict(l=60, r=20, t=40, b=50),
+                uirevision=uirev,
+            )
+            st.plotly_chart(fig, use_container_width=True, key="seismic_section",
+                            config={"responsive": True})
 
 # ================================================================== #
 # TAB 2 — SINGLE TRACE
