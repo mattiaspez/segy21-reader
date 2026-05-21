@@ -6,6 +6,8 @@ tests/rev0/*.segy
 tests/rev0/*.sgy
 tests/rev0/*.seg
 tests/rev21/*.segy
+!tests/rev21/equinor_segyio_small.segy
+!tests/rev21/equinor_segyio_prestack_small-ps.segy
 tests/rev21/*.sgy
 tests/rev21/*.sgy.gz
 
