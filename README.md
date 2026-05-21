@@ -101,6 +101,12 @@ Four tabs:
 | **Map** | Scatter plot of CDP X/Y positions (falls back to inline/crossline grid when coordinates are zero). |
 | **Headers** | Textual, binary, and extended headers. Binary header shown as a full field table. |
 
+![Seismic section tab](docs/screenshot_section.png)
+
+![Textual header tab](docs/screenshot_headers_textual.png)
+
+![Binary header tab](docs/screenshot_headers_binary.png)
+
 ## Project structure
 
 ```
