@@ -67,6 +67,54 @@ file_path = str(dir_path / selected_label)
 st.sidebar.caption(f"`{file_path}`")
 
 # ------------------------------------------------------------------ #
+# Grid-field auto-detection
+# ------------------------------------------------------------------ #
+
+_GRID_CANDIDATES = [
+    "trace_no_in_record",   # bytes 13-16 — used by many pre-Rev-1 processors for crossline
+    "energy_source_point",  # bytes 17-20 — used by many pre-Rev-1 processors for inline
+    "ensemble_no",
+    "field_record_no",
+    "cdp_x",
+    "cdp_y",
+    "inline",
+    "crossline",
+]
+
+def _find_grid_fields(df: pd.DataFrame) -> tuple[str | None, str | None]:
+    """
+    Return (inline_col, crossline_col) whose unique-count product is closest
+    to the total trace count (within 10%). Columns with all-zero, negative,
+    or implausibly large values (> 100 000) are excluded.
+    Returns (None, None) if no suitable pair is found.
+    """
+    n_traces = len(df)
+    valid = []
+    for col in _GRID_CANDIDATES:
+        if col not in df.columns:
+            continue
+        s = df[col]
+        if s.eq(0).all() or s.min() < 0 or s.max() > 100_000:
+            continue
+        n_unique = s.nunique()
+        if 2 <= n_unique <= 10_000:
+            valid.append((col, n_unique))
+
+    best_pair, best_err = None, float("inf")
+    for i, (ca, nu_a) in enumerate(valid):
+        for cb, nu_b in valid[i + 1:]:
+            err = abs(nu_a * nu_b - n_traces) / n_traces
+            if err < best_err:
+                best_err = err
+                # larger unique count → inline (conventional for most surveys)
+                best_pair = (ca, cb) if nu_a >= nu_b else (cb, ca)
+
+    if best_err > 0.10:
+        return None, None
+    return best_pair
+
+
+# ------------------------------------------------------------------ #
 # Data loading (cached)
 # ------------------------------------------------------------------ #
 
@@ -83,14 +131,19 @@ def load_segy(path: str):
 
         for hdr, data in r.traces():
             headers.append({
-                "trace_seq":  hdr.get("trace_seq_file", 0),
-                "inline":     hdr.get("inline_no", 0),
-                "crossline":  hdr.get("crossline_no", 0),
-                "cdp_x":      hdr.get("cdp_x", 0),
-                "cdp_y":      hdr.get("cdp_y", 0),
-                "offset":     hdr.get("source_receiver_dist", 0),
-                "num_samples":hdr.get("num_samples", 0),
-                "sample_interval_us": hdr.get("sample_interval_us", 0),
+                "trace_seq":            hdr.get("trace_seq_file", 0),
+                "inline":               hdr.get("inline_no", 0),
+                "crossline":            hdr.get("crossline_no", 0),
+                "cdp_x":                hdr.get("cdp_x", 0),
+                "cdp_y":                hdr.get("cdp_y", 0),
+                "offset":               hdr.get("source_receiver_dist", 0),
+                "num_samples":          hdr.get("num_samples", 0),
+                "sample_interval_us":   hdr.get("sample_interval_us", 0),
+                # Extra candidates for non-standard inline/crossline locations
+                "field_record_no":      hdr.get("field_record_no", 0),
+                "trace_no_in_record":   hdr.get("trace_no_in_record", 0),
+                "energy_source_point":  hdr.get("energy_source_point", 0),
+                "ensemble_no":          hdr.get("ensemble_no", 0),
             })
             traces_data.append(data.astype(np.float32))
 
@@ -130,28 +183,33 @@ def load_segy(path: str):
 
 data = load_segy(file_path)
 
+df = data["headers"].copy()
+
 if data["nonstandard_grid"]:
     st.warning(
         "**Non-standard header layout detected.** "
         "The inline/crossline fields at the standard SEG-Y bytes (189–196) contain "
         "implausibly large values — this file likely stores inline/crossline at "
-        "non-standard byte locations (common in pre-Rev-1 files). "
-        "Inline and crossline numbers shown in the app may be incorrect.",
+        "non-standard byte locations (common in pre-Rev-1 files).",
         icon="⚠️",
     )
-    remap = st.checkbox(
-        "Use CDP X/Y bytes (181–188) as inline/crossline instead",
-        value=False,
-        help="For some pre-Rev-1 files the standard CDP X/Y bytes happen to contain "
-             "the inline/crossline grid numbers. Enable this to use those values.",
-    )
-else:
-    remap = False
+    auto_il, auto_xl = _find_grid_fields(df)
+    field_opts = [c for c in _GRID_CANDIDATES if c in df.columns]
 
-df = data["headers"].copy()
-if remap:
-    df["inline"]    = df["cdp_x"]
-    df["crossline"] = df["cdp_y"]
+    with st.expander("Inline / crossline field mapping", expanded=True):
+        col_a, col_b = st.columns(2)
+        def _idx(col):
+            try:
+                return field_opts.index(col)
+            except (ValueError, TypeError):
+                return 0
+        with col_a:
+            il_field = st.selectbox("Inline field", field_opts, index=_idx(auto_il))
+        with col_b:
+            xl_field = st.selectbox("Crossline field", field_opts, index=_idx(auto_xl))
+
+    df["inline"]    = df[il_field]
+    df["crossline"] = df[xl_field]
 cube = data["cube"]
 time = data["time_ms"]
 bh   = data["binary"]
@@ -304,9 +362,23 @@ def _section_tab(df, cube, time, data):
         x_label = "Trace #"
         x_vals  = df.index.values
 
-    section = cube[mask.values]
+    section  = cube[mask.values]
+    n_orig   = section.shape[0]
+
+    # Downsample if too many traces — Streamlit's WebSocket cap is 200 MB.
+    # 2000 traces × 1501 samples × 4 bytes × ~3× JSON overhead ≈ 36 MB, safely under.
+    MAX_DISPLAY_TRACES = 2000
+    if n_orig > MAX_DISPLAY_TRACES:
+        step    = max(1, n_orig // MAX_DISPLAY_TRACES)
+        section = section[::step]
+        x_vals  = x_vals[::step]
 
     with col_ctrl:
+        if n_orig > MAX_DISPLAY_TRACES:
+            st.info(
+                f"Showing every {step}th trace "
+                f"({section.shape[0]} of {n_orig} displayed)."
+            )
         if display_mode == "Wiggles" and section.shape[0] > 500:
             st.warning(f"Too many traces ({section.shape[0]}) for wiggle display (limit 500).")
 
